@@ -1,0 +1,1078 @@
+/* ==================================================================== *
+ * keywordEngine.js — a dynamic, self-building keyword + entity engine
+ * for county / local-government text.
+ *
+ * What makes it "smart" without calling out to a model:
+ *   • One compiled regex per run, with NAMED GROUPS, so a single pass
+ *     tells you WHICH department a hit belongs to (no N regexes, no
+ *     N passes over the text).
+ *   • Morphology tolerance   — closure / closures / closed / closing
+ *   • Orthography tolerance  — right-of-way == right of way == rightofway
+ *   • Case-sensitive acronym lane (ROW, TIF, ADA) so plain "row" is ignored
+ *   • Fuzzy recovery         — bounded Levenshtein rescues "detor",
+ *                              "culvirt", "resurfaceing"
+ *   • Negation / hedging     — "no lane closure", "meeting cancelled"
+ *                              flips a hit's polarity instead of counting it
+ *   • Weighted scoring       — multi-word phrases and rare terms outrank
+ *                              generic ones; confidence is normalized
+ *                              across departments, with a margin check
+ *   • Urgency + action signals, deadline awareness
+ *   • Vocabulary discovery   — proposes unseen capitalized phrases as
+ *                              candidate keywords (the "learning" loop)
+ *   • Runtime learning       — matcher.learn(category, term) recompiles
+ *
+ * Zero dependencies. Pure functions. Safe to run on every keystroke.
+ * ==================================================================== */
+
+/* -------------------------------------------------------------------- *
+ * 1. TAXONOMY
+ *    A term may be a plain string (weight 1) or { t, w } for weighting.
+ *    `acronyms` are matched case-sensitively in their own pass.
+ * -------------------------------------------------------------------- */
+
+export const TAXONOMY = {
+  engineer: {
+    label: "County Engineer",
+    color: "#0093C0",
+    acronyms: ["ROW", "DOT", "MUTCD", "NEPA", "AADT", "CIP", "RFP", "RFQ", "IFB", "NPDES", "MS4", "ADA", "CR", "FM", "TSP"],
+    terms: [
+      { t: "road closure", w: 3 }, { t: "lane closure", w: 3 }, { t: "full closure", w: 3 },
+      { t: "rolling closure", w: 3 }, { t: "detour route", w: 3 }, { t: "detour", w: 2 },
+      { t: "alternate route", w: 2 }, { t: "traffic control", w: 2 }, { t: "flagger", w: 2 },
+      { t: "work zone", w: 2 }, { t: "shoulder work", w: 2 },
+      { t: "pavement rehabilitation", w: 3 }, { t: "road resurfacing", w: 3 },
+      { t: "chip seal", w: 3 }, { t: "cold in-place recycling", w: 3 }, { t: "crack sealing", w: 2 },
+      { t: "overlay", w: 2 }, { t: "milling", w: 2 }, { t: "subgrade", w: 2 }, { t: "base stabilization", w: 3 },
+      { t: "granular surfacing", w: 3 }, { t: "gravel road", w: 2 }, { t: "dust control", w: 2 },
+      { t: "bridge repair", w: 3 }, { t: "bridge replacement", w: 3 }, { t: "bridge inspection", w: 3 },
+      { t: "load posting", w: 3 }, { t: "weight limit", w: 2 }, { t: "embargo", w: 2 },
+      { t: "culvert replacement", w: 3 }, { t: "box culvert", w: 3 }, { t: "drainage improvement", w: 3 },
+      { t: "storm sewer", w: 2 }, { t: "ditch cleaning", w: 2 }, { t: "erosion control", w: 2 },
+      { t: "riprap", w: 3 }, { t: "grading", w: 2 },
+      { t: "traffic signal upgrade", w: 3 }, { t: "signal timing", w: 3 }, { t: "stop sign", w: 2 },
+      { t: "roundabout", w: 3 }, { t: "intersection improvement", w: 3 }, { t: "turn lane", w: 2 },
+      { t: "guardrail", w: 3 }, { t: "rumble strip", w: 3 }, { t: "pavement marking", w: 3 },
+      { t: "striping", w: 2 }, { t: "signage", w: 2 }, { t: "speed limit", w: 2 },
+      { t: "sight distance", w: 3 }, { t: "safety improvement", w: 2 },
+      { t: "pedestrian crossing", w: 3 }, { t: "crosswalk", w: 2 }, { t: "bicycle lane", w: 3 },
+      { t: "shared use path", w: 3 }, { t: "sidewalk construction", w: 3 }, { t: "curb ramp", w: 3 },
+      { t: "trail connection", w: 2 },
+      { t: "right-of-way acquisition", w: 3 }, { t: "right-of-way", w: 2 }, { t: "easement", w: 2 },
+      { t: "condemnation", w: 3 }, { t: "utility relocation", w: 3 }, { t: "utility permit", w: 2 },
+      { t: "driveway permit", w: 2 }, { t: "access permit", w: 2 }, { t: "oversize load permit", w: 3 },
+      { t: "environmental study", w: 3 }, { t: "wetland mitigation", w: 3 }, { t: "archaeological survey", w: 3 },
+      { t: "geotechnical", w: 3 }, { t: "survey crew", w: 2 }, { t: "preliminary design", w: 2 },
+      { t: "final design", w: 2 }, { t: "plan set", w: 2 }, { t: "specifications", w: 1 },
+      { t: "letting", w: 2 }, { t: "bid opening", w: 3 }, { t: "notice to proceed", w: 3 },
+      { t: "change order", w: 3 }, { t: "contractor", w: 1 }, { t: "prime contractor", w: 2 },
+      { t: "substantial completion", w: 3 }, { t: "punch list", w: 3 },
+      { t: "construction timeline", w: 2 }, { t: "project schedule", w: 2 }, { t: "project budget", w: 2 },
+      { t: "project status update", w: 2 }, { t: "project completion", w: 2 },
+      { t: "improvement project", w: 2 }, { t: "capital improvement plan", w: 3 },
+      { t: "five-year program", w: 3 }, { t: "farm to market", w: 3 },
+      { t: "secondary road", w: 3 }, { t: "county road", w: 2 }, { t: "state highway", w: 2 },
+      { t: "snow removal", w: 3 }, { t: "snowplow", w: 3 }, { t: "anti-icing", w: 3 },
+      { t: "brine", w: 2 }, { t: "level of service", w: 2 },
+      { t: "heavy equipment", w: 2 }, { t: "motor grader", w: 3 }, { t: "maintenance shed", w: 2 },
+      { t: "traffic flow", w: 2 }, { t: "traffic congestion", w: 2 }, { t: "traffic count", w: 2 },
+      { t: "ribbon-cutting ceremony", w: 2 }, { t: "engineer", w: 2 }, { t: "engineering", w: 1 },
+      { t: "construction", w: 1 }, { t: "county", w: 0.5 },
+    ],
+  },
+
+  auditor: {
+    label: "County Auditor",
+    color: "#016082",
+    acronyms: ["GAAP", "GASB", "ACFR", "CAFR", "FY", "TIF", "ARPA", "CDBG", "SEAT", "LOSST", "AP", "GL", "W-2", "1099"],
+    terms: [
+      { t: "auditor", w: 3 }, { t: "audit", w: 2 }, { t: "financial statement", w: 3 },
+      { t: "annual financial report", w: 3 }, { t: "general ledger", w: 3 }, { t: "trial balance", w: 3 },
+      { t: "reconciliation", w: 3 }, { t: "internal control", w: 3 }, { t: "material weakness", w: 3 },
+      { t: "audit finding", w: 3 }, { t: "management letter", w: 3 }, { t: "single audit", w: 3 },
+      { t: "accounts payable", w: 3 }, { t: "accounts receivable", w: 3 }, { t: "claims register", w: 3 },
+      { t: "warrant", w: 2 }, { t: "purchase order", w: 2 }, { t: "encumbrance", w: 3 },
+      { t: "appropriation", w: 3 }, { t: "budget amendment", w: 3 }, { t: "budget hearing", w: 3 },
+      { t: "certified budget", w: 3 }, { t: "fiscal year", w: 2 }, { t: "fund balance", w: 3 },
+      { t: "general fund", w: 2 }, { t: "special revenue fund", w: 3 }, { t: "debt service", w: 3 },
+      { t: "bond issuance", w: 3 }, { t: "levy rate", w: 3 }, { t: "tax levy", w: 3 },
+      { t: "taxable valuation", w: 3 }, { t: "rollback", w: 2 }, { t: "assessed value", w: 3 },
+      { t: "property tax", w: 2 }, { t: "homestead credit", w: 3 }, { t: "military exemption", w: 3 },
+      { t: "tax increment financing", w: 3 }, { t: "drainage assessment", w: 3 },
+      { t: "real estate transfer", w: 3 }, { t: "deed transfer", w: 3 }, { t: "plat", w: 2 },
+      { t: "payroll", w: 2 }, { t: "timesheet", w: 2 }, { t: "benefits administration", w: 3 },
+      { t: "vendor payment", w: 3 }, { t: "procurement", w: 2 }, { t: "grant reporting", w: 3 },
+      { t: "grant reimbursement", w: 3 }, { t: "cost allocation", w: 3 }, { t: "depreciation", w: 2 },
+      { t: "capital asset", w: 2 }, { t: "inventory count", w: 2 },
+      { t: "board of supervisors", w: 3 }, { t: "county board", w: 2 }, { t: "minutes", w: 1 },
+      { t: "resolution", w: 2 }, { t: "ordinance", w: 2 }, { t: "public hearing", w: 2 },
+      { t: "department", w: 0.5 }, { t: "records retention", w: 2 }, { t: "open records", w: 2 },
+    ],
+  },
+
+  treasurer: {
+    label: "Treasurer",
+    color: "#7A4FBF",
+    acronyms: ["ACH", "EFT", "DMV", "VIN"],
+    terms: [
+      { t: "treasurer", w: 3 }, { t: "tax statement", w: 3 }, { t: "tax sale", w: 3 },
+      { t: "delinquent tax", w: 3 }, { t: "escrow", w: 2 }, { t: "installment due", w: 3 },
+      { t: "penalty and interest", w: 3 }, { t: "receipt", w: 1 }, { t: "investment policy", w: 3 },
+      { t: "cash position", w: 3 }, { t: "bank reconciliation", w: 3 }, { t: "vehicle registration", w: 3 },
+      { t: "title transfer", w: 3 }, { t: "license plate", w: 3 }, { t: "driver's license", w: 3 },
+      { t: "renewal notice", w: 2 }, { t: "mobile home tax", w: 3 },
+    ],
+  },
+
+  clerkElections: {
+    label: "Clerk / Elections",
+    color: "#C0392B",
+    acronyms: ["HAVA", "VR", "ADA"],
+    terms: [
+      { t: "election", w: 3 }, { t: "absentee ballot", w: 3 }, { t: "early voting", w: 3 },
+      { t: "polling place", w: 3 }, { t: "precinct", w: 3 }, { t: "voter registration", w: 3 },
+      { t: "ballot measure", w: 3 }, { t: "canvass", w: 3 }, { t: "recount", w: 3 },
+      { t: "provisional ballot", w: 3 }, { t: "poll worker", w: 3 }, { t: "voting equipment", w: 3 },
+      { t: "logic and accuracy test", w: 3 }, { t: "nomination petition", w: 3 },
+      { t: "marriage license", w: 3 }, { t: "vital records", w: 3 }, { t: "birth certificate", w: 3 },
+      { t: "passport application", w: 3 }, { t: "notary", w: 2 },
+    ],
+  },
+
+  planningZoning: {
+    label: "Planning & Zoning",
+    color: "#1E8449",
+    acronyms: ["CUP", "PUD", "BOA", "GIS", "FEMA"],
+    terms: [
+      { t: "zoning", w: 3 }, { t: "rezoning", w: 3 }, { t: "variance", w: 3 },
+      { t: "conditional use permit", w: 3 }, { t: "subdivision", w: 3 }, { t: "site plan", w: 3 },
+      { t: "setback", w: 3 }, { t: "comprehensive plan", w: 3 }, { t: "land use", w: 2 },
+      { t: "building permit", w: 3 }, { t: "code enforcement", w: 3 }, { t: "nuisance abatement", w: 3 },
+      { t: "floodplain", w: 3 }, { t: "flood map", w: 3 }, { t: "board of adjustment", w: 3 },
+      { t: "planning commission", w: 3 }, { t: "annexation", w: 3 }, { t: "solar ordinance", w: 3 },
+      { t: "wind ordinance", w: 3 }, { t: "feedlot", w: 2 },
+    ],
+  },
+
+  emergency: {
+    label: "Emergency Management",
+    color: "#D35400",
+    acronyms: ["EMA", "EOC", "FEMA", "NWS", "EMS", "PSAP", "911"],
+    terms: [
+      { t: "emergency management", w: 3 }, { t: "disaster declaration", w: 3 },
+      { t: "emergency operations center", w: 3 }, { t: "evacuation", w: 3 }, { t: "shelter in place", w: 3 },
+      { t: "flood warning", w: 3 }, { t: "tornado warning", w: 3 }, { t: "severe weather", w: 3 },
+      { t: "winter storm", w: 3 }, { t: "travel advisory", w: 3 }, { t: "road conditions", w: 2 },
+      { t: "hazmat", w: 3 }, { t: "mutual aid", w: 3 }, { t: "damage assessment", w: 3 },
+      { t: "public safety", w: 2 }, { t: "first responder", w: 3 }, { t: "siren test", w: 3 },
+    ],
+  },
+
+  publicEngagement: {
+    label: "Public Engagement",
+    color: "#B7950B",
+    acronyms: ["FAQ", "PSA"],
+    terms: [
+      { t: "public meeting", w: 3 }, { t: "public input", w: 3 }, { t: "public comment", w: 3 },
+      { t: "comment period", w: 3 }, { t: "open house", w: 3 }, { t: "listening session", w: 3 },
+      { t: "survey", w: 2 }, { t: "town hall", w: 3 }, { t: "press release", w: 2 },
+      { t: "news release", w: 2 }, { t: "notice of hearing", w: 3 }, { t: "agenda", w: 2 },
+      { t: "accessibility accommodation", w: 3 }, { t: "interpreter", w: 2 }, { t: "translation", w: 2 },
+    ],
+  },
+};
+
+/* Aliases: surface form -> canonical term. Expanded before compilation,
+   so "ROW acquisition" and "right of way acquisition" score identically. */
+export const ALIASES = {
+  // NB: bare "row" is deliberately NOT an alias — it would fire on "front
+  // row". The case-sensitive acronym lane handles "ROW" on its own.
+  "row acquisition": "right-of-way acquisition",
+  "r.o.w. acquisition": "right-of-way acquisition",
+  "temporary closure": "road closure",
+  "closed to thru traffic": "road closure",
+  "closed to through traffic": "road closure",
+  "thru traffic": "road closure",
+  "blacktop": "pavement rehabilitation",
+  "hard surface": "pavement rehabilitation",
+  "resurface": "road resurfacing",
+  "repave": "road resurfacing",
+  "signal light": "traffic signal upgrade",
+  "stoplight": "traffic signal upgrade",
+  "traffic light": "traffic signal upgrade",
+  "bike lane": "bicycle lane",
+  "walkway": "sidewalk construction",
+  "snow plow": "snowplow",
+  "plowing": "snow removal",
+  "bid letting": "letting",
+  "budget hearing notice": "budget hearing",
+  "tif": "tax increment financing",
+  "acfr": "annual financial report",
+  "cafr": "annual financial report",
+  "levy hearing": "budget hearing",
+  "town meeting": "public meeting",
+  "community meeting": "public meeting",
+  "informational meeting": "public meeting",
+  "feedback period": "comment period",
+};
+
+/* Polarity + tone lexicons — these modulate a hit, they are not hits. */
+const NEGATORS =
+  /\b(?:no|not|never|without|cancel(?:l?ed|lation)?|postpon(?:ed|ement)|reschedul(?:ed|ing)|suspend(?:ed)?|delay(?:ed)?|call(?:ed)? off|withdraw(?:n)?|denied|reject(?:ed)?|unlikely|avoid)\b/i;
+
+const HEDGES =
+  /\b(?:may|might|could|possibly|potential(?:ly)?|tentative(?:ly)?|proposed|anticipat(?:ed|es)|expect(?:ed)?|subject to change|pending|preliminar(?:y|ily)|approximately|estimated)\b/i;
+
+const URGENCY = [
+  { re: /\b(?:emergency|immediate(?:ly)?|urgent|without (?:further )?notice|effective immediately|until further notice|life[- ]threatening|evacuat\w*)\b/gi, level: 3 },
+  { re: /\b(?:deadline|expires?|last day|must be (?:received|submitted)|no later than|closing (?:date|soon)|final notice|required)\b/gi, level: 2 },
+  { re: /\b(?:reminder|upcoming|scheduled|planned|advis\w+|please note)\b/gi, level: 1 },
+];
+
+const ACTIONS =
+  /\b(?:submit|apply|register|attend|call|contact|email|visit|complete|return|sign up|rsvp|comment|review|download|request|report|renew|pay|file)\b/gi;
+
+/* -------------------------------------------------------------------- *
+ * 2. ENTITY PATTERNS
+ * -------------------------------------------------------------------- */
+
+export const ENTITY_PATTERNS = {
+  // Bare domains are allowed, but (?<![@\w.-]) keeps the tail of an email
+  // address ("…@boonecounty.gov") from also being reported as a URL.
+  url: /\b(?:https?:\/\/|www\.)[^\s<>"'`]+|(?<![@\w.-])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:gov|org|com|net|edu|us|io|info)\b(?:\/[^\s<>"'`]*)?/gi,
+
+  email:
+    /\b[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}\b/g,
+
+  // Group 1 = the number. Label-driven, so a fax never doubles as a phone.
+  fax: /\b(?:fax|facsimile)\s*(?:number|no\.?|#)?\s*[:.\-]?\s*((?:\+?1[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]?\d{3}[\s.-]?\d{4})/gi,
+
+  phone:
+    /(?<!\d)(?:\+?1[\s.-]?)?(?:\(\d{3}\)\s*|\d{3}[\s.-])\d{3}[\s.-]?\d{4}(?:\s*(?:x|ext\.?|extension)\s*\d{1,6})?(?!\d)/gi,
+
+  // Trailing (?!\w) rather than \b, so the final dot of "7:00 a.m." is kept.
+  time: /\b(?:(?:0?[1-9]|1[0-2])(?::[0-5]\d){0,2}\s*[ap]\.?\s?m\.?|(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?(?:\s*(?:hrs?|hours))?|noon|midnight)(?!\w)/gi,
+
+  money: /(?<![\w.])\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?(?:\s*(?:million|billion|k|m|b)\b)?|\b\d{1,3}(?:,\d{3})*(?:\.\d{2})?\s*dollars\b/gi,
+
+  percent: /\b\d{1,3}(?:\.\d+)?\s?(?:%|percent)\b/gi,
+
+  // CR 42, County Road B-40, US-30, I-80, State Highway 141, FM 1960
+  route:
+    /\b(?:(?:County\s+(?:Road|Highway)|C\.?R\.?|F\.?M\.?|State\s+(?:Highway|Route)|S\.?H\.?|U\.?S\.?(?:\s+Highway)?|Interstate|I|Hwy|Highway|Route|Rte)\.?\s*[-#]?\s*[A-Z]?-?\d{1,4}[A-Z]?)\b/g,
+
+  ordinance:
+    /\b(?:Ordinance|Resolution|Bill|Case|Docket|Permit|Project|Contract|Bid|RFP|RFQ|IFB)\s*(?:No\.?|Number|#)?\s*[A-Z]{0,4}-?\d{2,6}(?:-\d{1,6})*\b/gi,
+
+  parcel: /\b(?:parcel|APN|PIN)\s*(?:id|no\.?|number|#)?\s*[:.\-]?\s*[\dA-Z]{2,}(?:[-.][\dA-Z]{2,}){1,5}\b/gi,
+
+  measure:
+    /\b\d{1,4}(?:[.,]\d+)?\s*(?:miles?|mi\.?|feet|ft\.?|foot|yards?|inches|in\.?|tons?|acres?|square feet|sq\.? ?ft\.?|lane miles?|mph)\b/gi,
+
+  duration:
+    /\b(?:\d{1,3}\s*(?:-|to|through|thru)\s*)?\d{1,3}\s*(?:minutes?|hours?|days?|weeks?|months?|years?|business days?|calendar days?)\b/gi,
+
+  address: new RegExp(
+    [
+      /\b\d{1,6}[A-Za-z]?\s+/.source,
+      /(?:(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West)\.?\s+)?/.source,
+      /(?:[A-Za-z0-9.'-]+\s+){0,4}/.source,
+      /(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Court|Ct|Circle|Cir|Place|Pl|Parkway|Pkwy|Highway|Hwy|Terrace|Ter|Trail|Trl|Way|Square|Sq|Loop|Route|Rte|County\s+Road|CR|FM)\b\.?/.source,
+      /(?:\s*(?:#|Apt\.?|Suite|Ste\.?|Unit|Bldg\.?|Floor|Fl\.?|Room|Rm\.?)\s*[A-Za-z0-9-]+)?/.source,
+      /(?:,\s*[A-Za-z][A-Za-z .'-]{1,30})?/.source,
+      /(?:,?\s*(?:A[LKZR]|C[AOT]|D[EC]|FL|GA|HI|I[ADLN]|K[SY]|LA|M[ADEINOST]|N[CDEHJMVY]|O[HKR]|PA|RI|S[CD]|T[NX]|UT|V[AT]|W[AIVY])\b)?/.source,
+      /(?:\s+\d{5}(?:-\d{4})?)?/.source,
+    ].join(""),
+    "gi"
+  ),
+};
+
+const MONTHS =
+  "Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?";
+
+ENTITY_PATTERNS.date = new RegExp(
+  `\\b(?:(?:Mon|Tues?|Wed(?:nes)?|Thur?s?|Fri|Satur?|Sun)(?:day)?,?\\s+)?` +
+    `(?:(?:${MONTHS})\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?(?:,?\\s*\\d{4})?` +
+    `|\\d{1,2}(?:st|nd|rd|th)?\\s+(?:${MONTHS})\\.?,?\\s*\\d{4}` +
+    `|\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}` +
+    `|\\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\\d|3[01]))\\b`,
+  "gi"
+);
+
+/* -------------------------------------------------------------------- *
+ * 3. COMPILER
+ * -------------------------------------------------------------------- */
+
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * "right-of-way acquisition" ->
+ *   right[\s.\-]*of[\s.\-]*way[\s.\-]+acquisition(?:s|es|ed|ing)?
+ * Separators are elastic, so spacing, hyphens and dots all match.
+ */
+const termToSource = (term) => {
+  const parts = term.split(/[\s-]+/).map(escapeRe);
+  const stem = parts.join("[\\s.\\-]*");
+  return `${stem}(?:ies|es|s|ed|ing)?`;
+};
+
+const normalize = (s) =>
+  s
+    .toLowerCase()
+    .replace(/[.\-_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/(?:ies|ing|ed|es|s)$/, "");
+
+const termText = (t) => (typeof t === "string" ? t : t.t);
+const termWeight = (t) => (typeof t === "string" ? 1 : t.w ?? 1);
+
+/**
+ * Compiles the whole taxonomy into:
+ *   wordRe     — one /gi regex, named group per category
+ *   acroRe     — one /g  regex (case-sensitive), named group per category
+ *   lookup     — normalized surface -> { canonical, category, weight }
+ *   vocabulary — flat list used by the fuzzy pass
+ */
+export function compile(taxonomy = TAXONOMY, aliases = ALIASES) {
+  const lookup = new Map();
+  const owners = new Map(); // surface -> every category that claims it
+  const vocabulary = [];
+  const wordParts = [];
+  const acroParts = [];
+  const claim = (surface, category) => {
+    const key = normalize(surface);
+    if (!owners.has(key)) owners.set(key, new Set());
+    owners.get(key).add(category);
+  };
+
+  for (const [category, def] of Object.entries(taxonomy)) {
+    const entries = def.terms.map((t) => ({
+      canonical: termText(t),
+      weight: termWeight(t),
+    }));
+
+    // Fold aliases into the category that owns their canonical term.
+    const owned = new Set(entries.map((e) => normalize(e.canonical)));
+    for (const [alias, canonical] of Object.entries(aliases)) {
+      if (owned.has(normalize(canonical))) {
+        const parent = entries.find((e) => normalize(e.canonical) === normalize(canonical));
+        entries.push({ canonical, weight: parent ? parent.weight : 1, surface: alias });
+      }
+    }
+
+    for (const e of entries) {
+      const surface = e.surface || e.canonical;
+      claim(surface, category);
+      lookup.set(normalize(surface), {
+        canonical: e.canonical,
+        category,
+        weight: e.weight,
+      });
+      vocabulary.push({ surface, canonical: e.canonical, category, weight: e.weight });
+    }
+
+    // Longest first: "road closure" must win before "road".
+    const sources = [...new Set(entries.map((e) => e.surface || e.canonical))]
+      .sort((a, b) => b.length - a.length)
+      .map(termToSource);
+
+    wordParts.push(`(?<${category}>${sources.join("|")})`);
+
+    if (def.acronyms?.length) {
+      const acros = [...def.acronyms].sort((a, b) => b.length - a.length).map(escapeRe);
+      acroParts.push(`(?<${category}>${acros.join("|")})`);
+      for (const a of def.acronyms) {
+        claim(a, category);
+        if (!lookup.has(normalize(a))) {
+          lookup.set(normalize(a), { canonical: a, category, weight: 2 });
+        }
+      }
+    }
+  }
+
+  return {
+    wordRe: new RegExp(`(?<![\\w-])(?:${wordParts.join("|")})(?![\\w-])`, "gi"),
+    acroRe: new RegExp(`(?<![\\w-])(?:${acroParts.join("|")})(?![\\w-])`, "g"),
+    lookup,
+    owners,
+    vocabulary,
+    categories: Object.keys(taxonomy),
+    taxonomy,
+  };
+}
+
+/* -------------------------------------------------------------------- *
+ * 4. FUZZY RECOVERY (bounded Levenshtein — early exit, never O(n·m) blowup)
+ * -------------------------------------------------------------------- */
+
+export function editDistance(a, b, max = 2) {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    let best = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      if (cur[j] < best) best = cur[j];
+    }
+    if (best > max) return max + 1; // whole row already past budget
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+const TOKEN_RE = /[\p{L}\p{N}]+(?:['’\-][\p{L}\p{N}]+)*/gu;
+
+/* Everyday words that sit one edit away from a real term
+   (mile/mill, plan/plat, road/road-…): never fuzzy-match these. */
+const FUZZY_STOP = new Set([
+  "mile", "miles", "plan", "plans", "place", "point", "phone", "price", "pride",
+  "board", "broad", "grade", "grant", "green", "great", "state", "stage", "share",
+  "there", "these", "those", "their", "three", "under", "until", "water", "where",
+  "while", "white", "whole", "would", "could", "should", "other", "order", "offer",
+  "close", "cost", "costs", "count", "court", "cover", "cross", "crews", "level",
+  "local", "lower", "north", "south", "first", "final", "field", "front",
+]);
+
+function fuzzyPass(text, compiled, claimed) {
+  const singles = compiled.vocabulary.filter(
+    (v) => !/[\s-]/.test(v.surface) && normalize(v.surface).length >= 5
+  );
+  const phrases = compiled.vocabulary
+    .filter((v) => /[\s-]/.test(v.surface))
+    .map((v) => ({ ...v, norm: normalize(v.surface), words: v.surface.split(/[\s-]+/).length }));
+
+  const tokens = [...text.matchAll(TOKEN_RE)];
+  const overlaps = (start, end) => claimed.some(([s, e]) => start < e && end > s);
+  const out = [];
+
+  /* --- multi-word pass: "culvirt replacment" -> culvert replacement ---
+     Sliding 2- and 3-token windows, compared only against vocabulary
+     phrases of a compatible length. Both prefilters (first letter, length
+     delta) fire before the O(n·m) work, so this stays cheap. */
+  for (let i = 0; i < tokens.length; i++) {
+    for (const span of [2, 3]) {
+      const last = tokens[i + span - 1];
+      if (!last) break;
+      const start = tokens[i].index;
+      const end = last.index + last[0].length;
+      if (overlaps(start, end)) continue;
+      const norm = normalize(text.slice(start, end));
+      if (compiled.lookup.has(norm)) continue;
+
+      let best = null;
+      for (const p of phrases) {
+        if (p.words !== span) continue;
+        const budget = p.norm.length >= 14 ? 3 : 2;
+        if (p.norm[0] !== norm[0]) continue;
+        if (Math.abs(p.norm.length - norm.length) > budget) continue;
+        const d = editDistance(norm, p.norm, budget);
+        if (d > 0 && d <= budget && (!best || d < best.distance)) best = { ...p, distance: d };
+      }
+      if (best) {
+        out.push({
+          text: text.slice(start, end),
+          index: start,
+          length: end - start,
+          canonical: best.canonical,
+          category: best.category,
+          weight: best.weight * 0.6,
+          kind: "fuzzy",
+          distance: best.distance,
+        });
+      }
+    }
+  }
+
+  /* --- single-token pass --- */
+  for (const m of tokens) {
+    const tok = m[0];
+    if (tok.length < 5) continue;
+    if (FUZZY_STOP.has(tok.toLowerCase())) continue;
+    // Never second-guess a span an entity extractor already owns
+    // (dates, routes, measurements, IDs).
+    if (claimed.some(([s, e]) => m.index < e && m.index + tok.length > s)) continue;
+
+    const norm = normalize(tok);
+    // Compare stems, not surfaces: "mile" (4) is too short to risk.
+    if (norm.length < 5 || compiled.lookup.has(norm)) continue;
+
+    const budget = norm.length >= 9 ? 2 : 1;
+    let best = null;
+    for (const v of singles) {
+      const target = normalize(v.surface);
+      if (target[0] !== norm[0]) continue; // first letter rarely mistyped
+      if (Math.abs(target.length - norm.length) > budget) continue;
+      const d = editDistance(norm, target, budget);
+      if (d <= budget && (!best || d < best.distance)) best = { ...v, distance: d };
+      if (best?.distance === 1) break;
+    }
+    if (best) {
+      out.push({
+        text: tok,
+        index: m.index,
+        length: tok.length,
+        canonical: best.canonical,
+        category: best.category,
+        weight: best.weight * 0.6, // fuzzy hits count, but count less
+        kind: "fuzzy",
+        distance: best.distance,
+      });
+    }
+  }
+  return out;
+}
+
+/* -------------------------------------------------------------------- *
+ * 5. COUNTERS
+ * -------------------------------------------------------------------- */
+
+const ABBREV_RE =
+  /\b(?:[A-Za-z]|Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Ave|Blvd|Rd|Hwy|Dept|Inc|Ltd|Co|Corp|Fig|No|Est|approx|etc|vs|e\.g|i\.e|a\.m|p\.m|U\.S(?:\.A)?)\./gi;
+
+export function countSentences(text) {
+  const cleaned = text
+    .replace(ABBREV_RE, (m) => m.replace(/\./g, ""))
+    .replace(/\d+\.\d+/g, (m) => m.replace(/\./g, ""))
+    .replace(/\.{3,}|…/g, "…");
+  return (cleaned.match(/[.!?…]+(?=["')\]]?(?:\s|$))/g) || []).length;
+}
+
+/** Flesch reading ease, rounded — a cheap "is this plain language?" signal. */
+const syllables = (w) =>
+  Math.max(1, (w.toLowerCase().replace(/e\b/g, "").match(/[aeiouy]+/g) || []).length);
+
+export function readability(text) {
+  const words = text.match(TOKEN_RE) || [];
+  const sentences = Math.max(1, countSentences(text));
+  if (!words.length) return null;
+  const syl = words.reduce((n, w) => n + syllables(w), 0);
+  const score = 206.835 - 1.015 * (words.length / sentences) - 84.6 * (syl / words.length);
+  const grade = Math.round(0.39 * (words.length / sentences) + 11.8 * (syl / words.length) - 15.59);
+  return {
+    flesch: Math.round(score),
+    grade: Math.max(1, grade),
+    label:
+      score >= 70 ? "Plain language" : score >= 50 ? "Fairly readable" : score >= 30 ? "Difficult" : "Very difficult",
+  };
+}
+
+/* -------------------------------------------------------------------- *
+ * 6. THE MATCHER
+ * -------------------------------------------------------------------- */
+
+export function createMatcher(taxonomy = TAXONOMY, aliases = ALIASES) {
+  let custom = structuredClone(taxonomy);
+  let compiled = compile(custom, aliases);
+
+  /** Runtime learning: add a term and recompile. */
+  const learn = (category, term, weight = 2) => {
+    if (!custom[category]) {
+      custom[category] = { label: category, color: "#555", terms: [], acronyms: [] };
+    }
+    const exists = custom[category].terms.some(
+      (t) => normalize(termText(t)) === normalize(term)
+    );
+    if (!exists) custom[category].terms.push({ t: term, w: weight });
+    compiled = compile(custom, aliases);
+    return compiled;
+  };
+
+  const forget = (category, term) => {
+    if (!custom[category]) return compiled;
+    custom[category].terms = custom[category].terms.filter(
+      (t) => normalize(termText(t)) !== normalize(term)
+    );
+    compiled = compile(custom, aliases);
+    return compiled;
+  };
+
+  function analyze(text, { fuzzy = true, context = 40 } = {}) {
+    if (!text?.trim()) return emptyResult(compiled);
+
+    /* ---- keyword pass (one regex, one sweep) ---- */
+    const raw = [];
+    const push = (m, kind) => {
+      const category = Object.keys(m.groups).find((k) => m.groups[k] !== undefined);
+      if (!category) return;
+      const meta = compiled.lookup.get(normalize(m[0])) || {};
+      raw.push({
+        text: m[0],
+        index: m.index,
+        length: m[0].length,
+        canonical: meta.canonical || normalize(m[0]),
+        category,
+        weight: meta.weight ?? 1,
+        kind,
+      });
+    };
+
+    for (const m of text.matchAll(compiled.wordRe)) push(m, "term");
+    for (const m of text.matchAll(compiled.acroRe)) push(m, "acronym");
+
+    let hits = dedupeOverlaps(raw);
+
+    /* ---- entities (also fence off spans the fuzzy pass must not touch) ---- */
+    const entities = extractEntities(text);
+
+    // Fuzzy matching is the only superlinear step; skip it on very long input.
+    if (fuzzy && text.length <= 20000) {
+      const claimed = [
+        ...hits.map((h) => [h.index, h.index + h.length]),
+        ...entitySpans(text),
+      ];
+      hits = dedupeOverlaps([...hits, ...fuzzyPass(text, compiled, claimed)]);
+    }
+
+    /* ---- polarity, hedging, context ---- */
+    for (const h of hits) {
+      // Negation never crosses a sentence boundary: "…no lane closure. ROW
+      // acquisition is complete." must not mark the acquisition negated.
+      const windowStart = Math.max(0, h.index - context);
+      const rawBefore = text.slice(windowStart, h.index);
+      const before = rawBefore.slice(rawBefore.search(/[.!?;\n][^.!?;\n]*$/) + 1);
+      const after = text.slice(h.index + h.length, h.index + h.length + context).split(/[.!?;\n]/)[0];
+      h.negated = NEGATORS.test(before) || /\b(?:cancel(?:l?ed)|postponed|has been lifted|reopened)\b/i.test(after);
+      h.hedged = HEDGES.test(before) || HEDGES.test(after);
+      h.snippet = `${before.replace(/\s+/g, " ")}⟦${h.text}⟧${after.replace(/\s+/g, " ")}`.trim();
+      h.effectiveWeight = h.weight * (h.negated ? 0.25 : 1) * (h.hedged ? 0.7 : 1);
+    }
+
+    /* ---- scoring: log-damped frequency, so one word repeated 40× can't
+           outweigh five distinct on-topic phrases, and negated/hedged hits
+           carry their reduced weight through ---- */
+    const scoreHits = (list) => {
+      const by = {};
+      for (const h of list) {
+        const c = (by[h.category] ??= { hits: [], terms: new Map(), score: 0 });
+        c.hits.push(h);
+        const t = c.terms.get(h.canonical) || { count: 0, weight: 0 };
+        t.count += 1;
+        t.weight += h.effectiveWeight;
+        c.terms.set(h.canonical, t);
+      }
+      for (const [cat, c] of Object.entries(by)) {
+        c.score = [...c.terms.values()].reduce(
+          (sum, t) => sum + (t.weight / t.count) * (1 + Math.log(t.count)),
+          0
+        );
+        c.label = compiled.taxonomy[cat]?.label ?? cat;
+        c.color = compiled.taxonomy[cat]?.color ?? "#555";
+        c.distinctTerms = c.terms.size;
+      }
+      return by;
+    };
+
+    /* Context-aware disambiguation: "FEMA" and "ADA" belong to more than one
+       department. Score the unambiguous evidence first, then hand each shared
+       term to whichever department the rest of the document supports. */
+    const sharedSet = new Set(
+      hits.filter((h) => (compiled.owners.get(normalize(h.text))?.size ?? 1) > 1)
+    );
+    if (sharedSet.size) {
+      const base = scoreHits(hits.filter((h) => !sharedSet.has(h)));
+      for (const h of sharedSet) {
+        const owners = [...compiled.owners.get(normalize(h.text))];
+        h.owners = owners;
+        h.category = owners.reduce(
+          (best, c) => ((base[c]?.score ?? 0) > (base[best]?.score ?? 0) ? c : best),
+          owners[0]
+        );
+        h.disambiguated = true;
+      }
+    }
+
+    const byCategory = scoreHits(hits);
+
+    const total = Object.values(byCategory).reduce((s, c) => s + c.score, 0) || 1;
+    const ranked = Object.entries(byCategory)
+      .map(([category, c]) => ({
+        category,
+        label: c.label,
+        color: c.color,
+        score: Number(c.score.toFixed(2)),
+        confidence: Number((c.score / total).toFixed(3)),
+        distinctTerms: c.distinctTerms,
+        terms: [...c.terms.entries()]
+          .sort((a, b) => b[1].count - a[1].count)
+          .map(([term, t]) => ({ term, count: t.count })),
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    const margin = ranked.length > 1 ? ranked[0].confidence - ranked[1].confidence : ranked[0]?.confidence ?? 0;
+
+    /* ---- signals ---- */
+    let urgency = 0;
+    const urgencyHits = [];
+    for (const { re, level } of URGENCY) {
+      const found = text.match(re) || [];
+      if (found.length) {
+        urgency = Math.max(urgency, level);
+        urgencyHits.push(...found);
+      }
+    }
+
+    /* ---- vocabulary discovery: repeated Capitalized Phrases we don't know ---- */
+    const suggestions = discoverTerms(text, compiled);
+
+    return {
+      hits,
+      ranked,
+      topCategory: ranked[0] ?? null,
+      confidence: ranked[0]?.confidence ?? 0,
+      ambiguous: ranked.length > 1 && margin < 0.15,
+      entities,
+      signals: {
+        urgency,
+        urgencyLabel: ["none", "informational", "time-sensitive", "urgent"][urgency],
+        urgencyHits: [...new Set(urgencyHits.map((u) => u.toLowerCase()))],
+        actions: [...new Set((text.match(ACTIONS) || []).map((a) => a.toLowerCase()))],
+        negatedHits: hits.filter((h) => h.negated).map((h) => h.canonical),
+        hedged: hits.some((h) => h.hedged),
+        hasDeadline: entities.date.length > 0 && urgency >= 2,
+        hasContact: entities.phone.length + entities.email.length > 0,
+      },
+      counts: {
+        chars: text.length,
+        words: (text.match(TOKEN_RE) || []).length,
+        sentences: countSentences(text),
+        keywords: hits.length,
+        distinctKeywords: new Set(hits.map((h) => h.canonical)).size,
+        density: Number(((hits.length / Math.max(1, (text.match(TOKEN_RE) || []).length)) * 100).toFixed(1)),
+      },
+      readability: readability(text),
+      suggestions,
+      highlights: toSegments(text, hits),
+    };
+  }
+
+  return {
+    analyze,
+    learn,
+    forget,
+    get compiled() {
+      return compiled;
+    },
+    get taxonomy() {
+      return custom;
+    },
+  };
+}
+
+/* -------------------------------------------------------------------- *
+ * 7. SUPPORT
+ * -------------------------------------------------------------------- */
+
+/** Keep the longest match at each position; drop anything it swallows. */
+function dedupeOverlaps(hits) {
+  const sorted = [...hits].sort((a, b) => a.index - b.index || b.length - a.length);
+  const kept = [];
+  let end = -1;
+  for (const h of sorted) {
+    if (h.index >= end) {
+      kept.push(h);
+      end = h.index + h.length;
+    }
+  }
+  return kept;
+}
+
+function extractEntities(text) {
+  const uniq = (a) => [...new Set(a)];
+  const faxes = uniq([...text.matchAll(ENTITY_PATTERNS.fax)].map((m) => m[1]));
+  const faxDigits = new Set(faxes.map((f) => f.replace(/\D/g, "")));
+
+  return {
+    url: uniq((text.match(ENTITY_PATTERNS.url) || []).map((u) => u.replace(/[.,;:!?)\]}'"]+$/, ""))),
+    email: uniq(text.match(ENTITY_PATTERNS.email) || []),
+    fax: faxes,
+    phone: uniq((text.match(ENTITY_PATTERNS.phone) || []).filter((p) => !faxDigits.has(p.replace(/\D/g, "")))),
+    address: uniq((text.match(ENTITY_PATTERNS.address) || []).map((a) => a.trim())),
+    time: uniq(text.match(ENTITY_PATTERNS.time) || []),
+    date: uniq(text.match(ENTITY_PATTERNS.date) || []),
+    money: uniq(text.match(ENTITY_PATTERNS.money) || []),
+    percent: uniq(text.match(ENTITY_PATTERNS.percent) || []),
+    route: uniq(text.match(ENTITY_PATTERNS.route) || []),
+    ordinance: uniq(text.match(ENTITY_PATTERNS.ordinance) || []),
+    parcel: uniq(text.match(ENTITY_PATTERNS.parcel) || []),
+    measure: uniq(text.match(ENTITY_PATTERNS.measure) || []),
+    duration: uniq(text.match(ENTITY_PATTERNS.duration) || []),
+  };
+}
+
+/* Character ranges owned by entity extractors. The fuzzy pass stays out of
+   them, so "3.5 miles", "CR 42" and "2026-114" are never "corrected". */
+function entitySpans(text) {
+  const spans = [];
+  for (const key of ["date", "time", "measure", "duration", "money", "percent", "route", "ordinance", "parcel", "phone", "email", "url", "address"]) {
+    for (const m of text.matchAll(ENTITY_PATTERNS[key])) {
+      spans.push([m.index, m.index + m[0].length]);
+    }
+  }
+  return spans;
+}
+
+const STOP_CAPS =
+  /^(?:The|A|An|This|That|These|Those|It|We|You|They|If|In|On|At|For|And|But|Or|Please|Note|Our|Their|His|Her|All|Any|Each|Every|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|January|February|March|April|May|June|July|August|September|October|November|December)$/;
+
+/** Unknown Capitalized Phrases seen 2+ times = candidate vocabulary. */
+function discoverTerms(text, compiled) {
+  // [ \t]+ not \s+ — a phrase must not run across a line break, or the same
+  // phrase gets counted under a different surface each time it appears.
+  const phrases =
+    text.match(/\b[A-Z][a-z]{2,}(?:[ \t]+(?:of|and|for|the)?[ \t]*[A-Z][a-z]{2,}){0,3}\b/g) || [];
+  const freq = new Map();
+  for (const raw of phrases) {
+    // Drop a leading/trailing stopword picked up by the window.
+    const p = raw
+      .replace(/^(?:The|A|An|This|That|Our|Their|Please|Note)\s+/, "")
+      .replace(/\s+(?:The|A|An|This|That|Our|Their|Please|Note)$/, "")
+      .trim();
+    if (!p || STOP_CAPS.test(p)) continue;
+    const norm = normalize(p);
+    if (compiled.lookup.has(norm)) continue;
+    if (norm.split(" ").length === 1 && norm.length < 5) continue;
+    freq.set(p, (freq.get(p) || 0) + 1);
+  }
+  return [...freq.entries()]
+    .filter(([, n]) => n >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([term, count]) => ({ term, count }));
+}
+
+/** Text split into {text, hit?} runs — ready to render with highlighting. */
+function toSegments(text, hits) {
+  const segs = [];
+  let cursor = 0;
+  for (const h of [...hits].sort((a, b) => a.index - b.index)) {
+    if (h.index > cursor) segs.push({ text: text.slice(cursor, h.index) });
+    segs.push({ text: text.slice(h.index, h.index + h.length), hit: h });
+    cursor = h.index + h.length;
+  }
+  if (cursor < text.length) segs.push({ text: text.slice(cursor) });
+  return segs;
+}
+
+function emptyResult(compiled) {
+  return {
+    hits: [],
+    ranked: [],
+    topCategory: null,
+    confidence: 0,
+    ambiguous: false,
+    entities: extractEntities(""),
+    signals: {
+      urgency: 0,
+      urgencyLabel: "none",
+      urgencyHits: [],
+      actions: [],
+      negatedHits: [],
+      hedged: false,
+      hasDeadline: false,
+      hasContact: false,
+    },
+    counts: { chars: 0, words: 0, sentences: 0, keywords: 0, distinctKeywords: 0, density: 0 },
+    readability: null,
+    suggestions: [],
+    highlights: [],
+    _categories: compiled.categories,
+  };
+}
+
+export { normalize, dedupeOverlaps, toSegments, discoverTerms, extractEntities };
+
+
+import React, { useMemo, useState } from "react";
+import { createMatcher } from "./keywordEngine";
+
+/* Assumes your existing artwork imports:
+     import EngineerSet from "./EngineerSet";
+     import AuditorSet  from "./AuditorSet";
+*/
+
+export default function Creator() {
+  const [wordIn, setNewWord] = useState("");
+  const [teachTerm, setTeachTerm] = useState("");
+  const [teachCat, setTeachCat] = useState("engineer");
+  const [vocabVersion, setVocabVersion] = useState(0); // bumped on learn/forget
+
+  // One matcher for the component's lifetime; learning recompiles in place.
+  const matcher = useMemo(() => createMatcher(), []);
+
+  // Re-runs on keystroke or after a term is taught. Everything downstream
+  // is derived — no effects, no cascade of setStates.
+  const result = useMemo(
+    () => matcher.analyze(wordIn),
+    [wordIn, matcher, vocabVersion]
+  );
+
+  const {
+    ranked, topCategory, confidence, ambiguous,
+    entities, signals, counts, readability, suggestions, highlights, hits,
+  } = result;
+
+  /* --- artwork: keyed by canonical term, so every alias, plural, acronym
+         and fuzzy hit resolves to the same asset ----------------------- */
+  const artwork = useMemo(
+    () => ({
+      engineer: EngineerSet[0][Math.floor(Math.random() * EngineerSet[0].length)],
+      "road closure": EngineerSet[0][Math.floor(Math.random() * EngineerSet[0].length)],
+      auditor: AuditorSet[0][Math.floor(Math.random() * AuditorSet[0].length)],
+      department: AuditorSet[0][Math.floor(Math.random() * AuditorSet[0].length)],
+    }),
+    []
+  );
+
+  const logos = { auditor: "", engineer: "" };
+
+  // Negated hits ("no lane closure") must not pull in closure artwork.
+  const imagesToDisplay = hits
+    .filter((h) => !h.negated && artwork[h.canonical])
+    .map((h, i) => <g key={`${h.canonical}-${h.index}-${i}`}>{artwork[h.canonical]}</g>);
+
+  const logoToDisplay = [...new Set(hits.map((h) => h.canonical))]
+    .filter((c) => logos[c])
+    .map((c, i) => (
+      <image href={logos[c]} key={c} alt={c} x={100 + i * 70} width={200} y={10} />
+    ));
+
+  const teach = () => {
+    const t = teachTerm.trim();
+    if (!t) return;
+    matcher.learn(teachCat, t, 3);
+    setTeachTerm("");
+    setVocabVersion((v) => v + 1);
+  };
+
+  const line = (label, list) =>
+    list?.length ? `${label}: ${list.join(", ")}` : "";
+
+  return (
+    <div className="creator">
+      <svg x="0px" y="0px" width="100%" height="100%" viewBox="0 0 400 327">
+        <rect fill="#DEF2FD" width="100%" height="100%" />
+
+        <g fontSize="11" fill="#016082">
+          <text x="20" y="80" fontSize="16" fill={topCategory?.color || "#016082"}>
+            {topCategory
+              ? `${topCategory.label} — ${Math.round(confidence * 100)}%${ambiguous ? " (mixed)" : ""}`
+              : "Start typing…"}
+          </text>
+          <text x="20" y="98">{line("URLs", entities.url)}</text>
+          <text x="20" y="114">{line("Emails", entities.email)}</text>
+          <text x="20" y="130">{line("Phone", entities.phone)}</text>
+          <text x="20" y="146">{line("Fax", entities.fax)}</text>
+          <text x="20" y="162">{line("Dates", entities.date)}</text>
+          <text x="20" y="178">{line("Times", entities.time)}</text>
+          <text x="20" y="194">{line("Routes", entities.route)}</text>
+          <text x="20" y="210">{line("Amounts", [...entities.money, ...entities.percent])}</text>
+          <text x="20" y="226">{line("Refs", [...entities.ordinance, ...entities.parcel])}</text>
+          <text x="20" y="242">{line("Measures", [...entities.measure, ...entities.duration])}</text>
+          <text x="20" y="258">{line("Address", entities.address)}</text>
+          <text x="20" y="278" fill="#D35400">
+            {signals.urgency ? `Urgency: ${signals.urgencyLabel}` : ""}
+          </text>
+        </g>
+
+        <g>{logoToDisplay}</g>
+        <g transform="scale(5.8)">{imagesToDisplay}</g>
+      </svg>
+
+      <textarea
+        placeholder="Start Typing Here .... "
+        value={wordIn}
+        onChange={(e) => setNewWord(e.target.value)}
+        rows={8}
+      />
+
+      {/* live routing confidence across every department */}
+      <ul className="routing">
+        {ranked.map((r) => (
+          <li key={r.category}>
+            <span style={{ color: r.color }}>{r.label}</span>
+            <meter min={0} max={1} value={r.confidence} />
+            {Math.round(r.confidence * 100)}% · {r.distinctTerms} terms
+          </li>
+        ))}
+      </ul>
+
+      {/* matched keywords, with why-it-counted annotations */}
+      <div className="chips">
+        {hits.map((h, i) => (
+          <span
+            key={`${h.canonical}-${h.index}-${i}`}
+            title={h.snippet}
+            className={[
+              "chip",
+              h.negated && "chip--negated",
+              h.hedged && "chip--hedged",
+              h.kind === "fuzzy" && "chip--fuzzy",
+            ]
+              .filter(Boolean)
+              .join(" ")}
+          >
+            {h.text}
+            {h.kind === "fuzzy" && ` → ${h.canonical}`}
+            {h.negated && " (negated)"}
+          </span>
+        ))}
+      </div>
+
+      {/* highlighted source text */}
+      <p className="preview">
+        {highlights.map((s, i) =>
+          s.hit ? (
+            <mark key={i} data-category={s.hit.category} data-negated={!!s.hit.negated}>
+              {s.text}
+            </mark>
+          ) : (
+            <React.Fragment key={i}>{s.text}</React.Fragment>
+          )
+        )}
+      </p>
+
+      {/* the learning loop: unknown repeated phrases, one click to adopt */}
+      {suggestions.length > 0 && (
+        <div className="suggestions">
+          New phrases seen more than once:
+          {suggestions.map((s) => (
+            <button
+              key={s.term}
+              onClick={() => {
+                matcher.learn(topCategory?.category || "engineer", s.term, 3);
+                setVocabVersion((v) => v + 1);
+              }}
+            >
+              + {s.term} ({s.count})
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="teach">
+        <input
+          value={teachTerm}
+          placeholder="Teach a keyword…"
+          onChange={(e) => setTeachTerm(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && teach()}
+        />
+        <select value={teachCat} onChange={(e) => setTeachCat(e.target.value)}>
+          {Object.entries(matcher.taxonomy).map(([key, def]) => (
+            <option key={key} value={key}>
+              {def.label}
+            </option>
+          ))}
+        </select>
+        <button onClick={teach}>Add</button>
+      </div>
+
+      <p className="stats">
+        <b>{counts.words}</b> words · {counts.sentences} sentences · {counts.chars} chars ·{" "}
+        {counts.distinctKeywords} distinct keywords · {counts.density}% density
+        {readability && ` · ${readability.label} (grade ${readability.grade})`}
+      </p>
+    </div>
+  );
+}
